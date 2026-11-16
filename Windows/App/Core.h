@@ -32,10 +32,8 @@ void setEmojiPickerOpen(bool open, HWND picker);
 void resetTyping();
 /// Types text into the focused app (KEYEVENTF_UNICODE; surrogate pairs for astral emoji).
 void insertText(const std::wstring& text);
-
-// Typing log
 std::wstring typingLogPath();
 void flushTypingLog();
 void clearTypingLog();
 
-}} // namespace
+}}

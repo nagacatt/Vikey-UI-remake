@@ -64,7 +64,7 @@ static bool _otherInputLanguage = false;          // Japanese/Chinese IME layout
 static int _languageTemp = 0;
 static std::vector<Byte> savedSmartSwitchKeyData;
 
-// ---- Auto switch by typing (same state machine as VikeyCore.mm) --------------------------
+// Auto switch by typing state machine (matches VikeyCore.mm).
 static Uint32 _enKeys[MAX_BUFF];
 static int _enCount = 0;
 static bool _enValid = true;
@@ -90,7 +90,6 @@ static int _undoneCount = 0;
 static void StartEnglishWord(bool valid) { _enCount = 0; _enValid = valid; _enAfterShortcut = false; }
 static void ResetEnglishWord(bool valid) { _enAfterDouble = false; _undoneCount = 0; StartEnglishWord(valid); _enPrevN = 0; _enNavOffset = 0; vAutoSwitchForget(); }   // also the D51 round trip: after a click or a switch → must not bring the old word back
 
-// ---- Typing log ------------------------------------------------------------------------
 int vTypingLogKeys = 1, vTypingLogEnabled = 0;
 static std::string _tlPending;
 static std::mutex _tlMutex;
@@ -199,7 +198,6 @@ static void TLManual(const char* via, int to) {
 static void TLUndo() { TLEndWord("undo"); _tlSinceAuto = false; TLCount("undo"); TLWrite(std::string("\"e\":\"undo\",\"via\":\"backspace\",\"to\":\"") + TLLang(_autoFixUndo.language) + "\""); }
 static void TLContext(int to) { TLEndWord("context"); TLCount("context"); TLWrite(std::string("\"e\":\"context\",\"to\":\"") + TLLang(to) + "\""); }
 
-// ---- Front app / smart switch -----------------------------------------------------------
 std::wstring frontAppName() { return _frontApp; }
 
 static void queryFrontMostApp() {
@@ -248,14 +246,14 @@ void onSiteChanged(const std::wstring& host) {
     startNewSession();
 }
 
-// ---- Other input language (Japanese, Chinese...) ------------------------------------------
+// Step aside when a non-Latin IME (Japanese, Chinese) is active.
 static void updateOtherInputLanguage() {
     HWND w = GetForegroundWindow(); DWORD tid = GetWindowThreadProcessId(w, nullptr);
     HKL hkl = GetKeyboardLayout(tid); LANGID lang = LOWORD((DWORD_PTR)hkl); WORD primary = PRIMARYLANGID(lang);
     _otherInputLanguage = !(primary == LANG_ENGLISH || primary == LANG_VIETNAMESE || primary == LANG_NEUTRAL);
 }
 
-// ---- Pause auto switch after a manual switch (D21) ------------------------------------------
+// Pause auto switch for 5 seconds after a manual switch (D21).
 static ULONGLONG _autoPauseUntil = 0;
 static bool AutoSwitchPaused() { return GetTickCount64() < _autoPauseUntil; }
 static void PauseAutoSwitchAfterManual() {
@@ -288,7 +286,6 @@ void reloadSettings() {
     if (_observer) _observer(vLanguage);
 }
 
-// ---- Sending output ----------------------------------------------------------------------
 static void inputKey(INPUT& in, WORD vk, bool down, DWORD extra = 0) {
     in = {}; in.type = INPUT_KEYBOARD; in.ki.wVk = vk; in.ki.dwFlags = (down ? 0 : KEYEVENTF_KEYUP) | extra; in.ki.dwExtraInfo = VIKEY_EVENT_TAG;
 }
@@ -334,9 +331,7 @@ static void SendEngineOutput() {
     flushBatch();
 }
 
-// ---- Hotkey ------------------------------------------------------------------------------
-/// flags: for a key hotkey (Alt+Z) the key press's own, so Alt held and Z again switches again; for modifiers
-/// alone (Ctrl+Shift) the most modifiers held before the release
+/// For a key hotkey (Alt+Z), flags come from the key press; for modifier-only (Ctrl+Shift), from peak modifiers before release.
 static bool checkHotKey(int hotKeyData, unsigned flags, bool checkKeyCode = true) {
     if ((hotKeyData & (~0x8000)) == EMPTY_HOTKEY) return false;
     if (HAS_CONTROL(hotKeyData) ^ GET_BOOL(flags & F_CONTROL)) return false;
@@ -370,7 +365,6 @@ void setLanguageQuiet(int lang) {
 int language() { return vLanguage; }
 void setLanguageObserver(std::function<void(int)> f) { _observer = f; }
 
-// ---- Emoji picker (Settings.cpp) ------------------------------------------------------------
 static std::function<void()> _emojiHandler;
 void setEmojiHotkeyHandler(std::function<void()> f) { _emojiHandler = f; }
 void setEmojiPickerOpen(bool open, HWND picker) { vEmojiWindow = picker; vEmojiOpen = open; }
@@ -390,7 +384,6 @@ void insertText(const std::wstring& text) {
     flushBatch();
 }
 
-// ---- Auto switch helpers (same as VikeyCore.mm) ---------------------------------------------
 static bool IsWhitespaceKey(Uint16 key) { return key == KEY_SPACE || key == KEY_RETURN || key == KEY_ENTER || key == KEY_TAB; }
 static bool IsWordStartKey(Uint16 key, bool shift) { return IsWhitespaceKey(key) || (key == KEY_9 && shift) || key == KEY_LEFT_BRACKET || key == KEY_QUOTE; }
 static bool IsLetterKey(Uint16 key) { for (Uint16 k : {KEY_A,KEY_B,KEY_C,KEY_D,KEY_E,KEY_F,KEY_G,KEY_H,KEY_I,KEY_J,KEY_K,KEY_L,KEY_M,KEY_N,KEY_O,KEY_P,KEY_Q,KEY_R,KEY_S,KEY_T,KEY_U,KEY_V,KEY_W,KEY_X,KEY_Y,KEY_Z}) if (k == key) return true; return false; }
@@ -515,7 +508,6 @@ static bool HandleEnglishKeyForAutoSwitch() {
     return true;
 }
 
-// ---- Hooks --------------------------------------------------------------------------------
 static bool modifierVk(DWORD vk, bool down) {
     unsigned bit = 0;
     switch (vk) { case VK_LSHIFT: case VK_RSHIFT: case VK_SHIFT: bit = F_SHIFT; break; case VK_LCONTROL: case VK_RCONTROL: case VK_CONTROL: bit = F_CONTROL; break;
@@ -660,4 +652,4 @@ void stop() {
 }
 bool isRunning() { return _kbHook != nullptr; }
 
-}} // namespace
+}}

@@ -5,9 +5,13 @@ IDI_APP ICON "Vikey.ico"
 IDR_SOUND_VI RCDATA "Sounds/SwitchToVietnamese.wav"
 IDR_SOUND_EN RCDATA "Sounds/SwitchToEnglish.wav"
 IDR_EMOJI_JSON RCDATA "../../App/Resources/Emoji.json"
+IDR_REZE_NIGHT RCDATA "Resources/reze_night.jpg"
+IDR_REZE_FLOWER RCDATA "Resources/reze_flower.jpg"
+IDR_REZE_GRAPHIC RCDATA "Resources/reze_graphic.jpg"
+IDR_REZE_ABYSS RCDATA "Resources/reze_abyss.jpg"
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,14,0
- PRODUCTVERSION 1,0,14,0
+ FILEVERSION 1,0,34,0
+ PRODUCTVERSION 1,0,34,0
  FILEOS 0x40004L
  FILETYPE 0x1L
 BEGIN
@@ -16,7 +20,7 @@ BEGIN
     BLOCK "040904b0"
     BEGIN
       VALUE "CompanyName", "Tony Dinh"
-      VALUE "FileDescription", "Vikey - Vietnamese typing"
+      VALUE "FileDescription", "Vikey - Vietnamese typing (Reze Edition)"
       VALUE "FileVersion", VIKEY_VERSION
       VALUE "InternalName", "Vikey"
       VALUE "LegalCopyright", "GPL-3.0. Based on OpenKey by Tuyen Mai."

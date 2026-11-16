@@ -1,11 +1,6 @@
-// Emoji picker: data + search (port of App/Model/EmojiSearch.swift) and the popup (port of App/Views/EmojiPicker.swift).
+// Emoji picker popup: Direct2D + DirectWrite renderer with bilingual Telex search and Reze dual-theme styling.
 #define _HAS_STD_BYTE 0
-// Drawn with Direct2D + DirectWrite because GDI/GDI+ cannot draw colour emoji (Segoe UI Emoji's colour glyphs).
-#include "Emoji.h"
-#include "Core.h"
-#include "Prefs.h"
-#include "KeyMap.h"
-#include "resource.h"
+#include <windows.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwmapi.h>
@@ -16,14 +11,18 @@
 #include <mutex>
 #include <thread>
 #include <functional>
+#include "Emoji.h"
+#include "Core.h"
+#include "Prefs.h"
+#include "KeyMap.h"
+#include "resource.h"
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "dwmapi.lib")
 
 namespace vikey { namespace emoji {
 
-// ---- data ------------------------------------------------------------------------------------
-struct Term {   // weight: name 3, keyword 2
+struct Term {
     std::wstring folded; std::vector<std::wstring> words; std::set<std::wstring> exactWords; int weight;
 };
 struct Emoji {
@@ -40,7 +39,7 @@ static std::vector<std::wstring> splitWords(const std::wstring& s, wchar_t sep =
 }
 static std::wstring trim(const std::wstring& s) { size_t a = s.find_first_not_of(L' '), b = s.find_last_not_of(L' '); return a == std::wstring::npos ? L"" : s.substr(a, b - a + 1); }
 
-/// Lowercase, no accents, đ -> d (EmojiIndex.fold).
+/// Lowercase, strip combining accents, and fold đ -> d.
 static std::wstring fold(const std::wstring& s) {
     std::wstring l = lower(s); if (l.empty()) return l;
     int n = NormalizeString(NormalizationD, l.c_str(), (int)l.size(), nullptr, 0);
@@ -54,14 +53,13 @@ static Term makeTerm(const std::wstring& text, int weight) {
     Term t; t.folded = fold(text); t.words = splitWords(t.folded); for (auto& w : splitWords(lower(text))) t.exactWords.insert(w); t.weight = weight; return t;
 }
 
-// A small JSON reader for Emoji.json: arrays of [string, number, number, string, string, string, string, [strings], number].
 struct JV { enum T { Str, Num, Arr, Other } t = Other; std::wstring s; double n = 0; std::vector<JV> a; };
 struct JParser {
     const char* p; const char* e;
     void ws() { while (p < e && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++; }
     static void utf16(std::wstring& o, unsigned cp) { if (cp < 0x10000) o += (wchar_t)cp; else { cp -= 0x10000; o += (wchar_t)(0xD800 + (cp >> 10)); o += (wchar_t)(0xDC00 + (cp & 0x3FF)); } }
     std::wstring str() {
-        std::string raw; p++;   // opening quote
+        std::string raw; p++;
         while (p < e && *p != '"') {
             if (*p == '\\') { p++; char c = *p++;
                 if (c == 'u') { unsigned cp = (unsigned)strtoul(std::string(p, p + 4).c_str(), nullptr, 16); p += 4;
@@ -78,17 +76,16 @@ struct JParser {
         if (*p == '"') { v.t = JV::Str; v.s = str(); }
         else if (*p == '[') { v.t = JV::Arr; p++; ws(); while (p < e && *p != ']') { v.a.push_back(value()); ws(); if (*p == ',') p++; ws(); } p++; }
         else if ((*p >= '0' && *p <= '9') || *p == '-') { v.t = JV::Num; char* end; v.n = strtod(p, &end); p = end; }
-        else { while (p < e && *p != ',' && *p != ']' && *p != '}') p++; }   // true/false/null: skipped
+        else { while (p < e && *p != ',' && *p != ']' && *p != '}') p++; }
         return v;
     }
 };
 
-static std::vector<Emoji> _all;              // every emoji this Windows can draw, in Unicode order
-static std::vector<std::pair<int, std::vector<int>>> _groups;   // group -> indices into _all
+static std::vector<Emoji> _all;
+static std::vector<std::pair<int, std::vector<int>>> _groups;
 static std::mutex _loadMutex; static bool _loaded = false;
 
-/// Segoe UI Emoji decides what is shown (newer emoji show as boxes, flags as letters): an emoji is drawable when
-/// its first code point has a glyph and the whole sequence shapes into one glyph cluster.
+/// Checks whether Segoe UI Emoji can shape the sequence into a single glyph cluster.
 struct GlyphCheck {
     IDWriteFactory* dw = nullptr; IDWriteTextFormat* fmt = nullptr; IDWriteFontFace* face = nullptr;
     GlyphCheck() {
@@ -124,14 +121,13 @@ static void loadIndex() {
         for (auto& row : root.a) {
             if (row.t != JV::Arr || row.a.size() < 8 || row.a[0].t != JV::Str) continue;
             Emoji e; e.ch = row.a[0].s; if (e.ch.empty()) continue;
-            if (e.ch.size() >= 2 && e.ch[0] == 0xD83C && e.ch[1] >= 0xDDE6 && e.ch[1] <= 0xDDFF) continue;   // country flags: Segoe UI Emoji draws them as two letters
-            if (e.ch.find(L"\xDB40") != std::wstring::npos) continue;   // tag sequences (England, Scotland, Wales): not in Segoe UI Emoji
+            if (e.ch.size() >= 2 && e.ch[0] == 0xD83C && e.ch[1] >= 0xDDE6 && e.ch[1] <= 0xDDFF) continue;
+            if (e.ch.find(L"\xDB40") != std::wstring::npos) continue;
             if (!gc.drawable(e.ch)) continue;
             e.group = (int)row.a[1].n; e.version = row.a[2].n; e.nameEN = row.a[3].s; e.nameVI = row.a[4].s;
             for (auto& s : {e.nameEN, e.nameVI}) if (!s.empty()) e.terms.push_back(makeTerm(s, 3));
             std::wstring kw = row.a[5].s + L" | " + row.a[6].s; size_t p = 0;
             while (p <= kw.size()) { size_t q = kw.find(L" | ", p); std::wstring k = kw.substr(p, q == std::wstring::npos ? std::wstring::npos : q - p); if (!k.empty()) e.terms.push_back(makeTerm(k, 2)); if (q == std::wstring::npos) break; p = q + 3; }
-            // emoticons (":D", "=))", "^_^") rank like names: typing one exactly puts its emoji first (Tony)
             if (row.a.size() > 9 && row.a[9].t == JV::Str) for (auto& t : splitWords(row.a[9].s)) e.terms.push_back(makeTerm(t, 3));
             if (row.a[7].t == JV::Arr) for (auto& s : row.a[7].a) e.skins.push_back(s.s);
             e.popularity = row.a.size() > 8 ? (int)row.a[8].n : 0;
@@ -143,7 +139,6 @@ static void loadIndex() {
     _loaded = true;
 }
 
-// ---- Telex reader (EmojiSearch.swift Telex) ---------------------------------------------------
 static const std::wstring VOWELS = L"aăâeêioôơuưy";
 static bool isVowel(wchar_t c) { return VOWELS.find(c) != std::wstring::npos; }
 static wchar_t marked(wchar_t base, int tone) {
@@ -152,7 +147,6 @@ static wchar_t marked(wchar_t base, int tone) {
         {L'o', L"óòỏõọ"}, {L'ô', L"ốồổỗộ"}, {L'ơ', L"ớờởỡợ"}, {L'u', L"úùủũụ"}, {L'ư', L"ứừửữự"}, {L'y', L"ýỳỷỹỵ"}};
     auto i = marks.find(base); return i == marks.end() ? base : i->second[tone - 1];
 }
-/// Where the tone mark goes (modern style: hoà, thuý).
 static int toneIndex(const std::wstring& w) {
     size_t start = 0;
     if (w.size() > 2 && w[0] == L'q' && w[1] == L'u') start = 2;
@@ -177,7 +171,7 @@ static std::wstring telexWord(const std::wstring& keys) {
         else if (k == L'a' && last == L'a') out.back() = L'â';
         else if (k == L'e' && last == L'e') out.back() = L'ê';
         else if (k == L'o' && last == L'o') out.back() = L'ô';
-        else if (k == L'w') {   // ươ (uow / uwow), ă, ơ, ư; a lone w is ư
+        else if (k == L'w') {
             int i = -1; for (int j = (int)out.size() - 1; j >= 0; j--) if (out[j] == L'a' || out[j] == L'o' || out[j] == L'u') { i = j; break; }
             bool restNoVowel = true; if (i >= 0) for (size_t j = i + 1; j < out.size(); j++) if (isVowel(out[j])) restNoVowel = false;
             if (i >= 0 && (restNoVowel || i == (int)out.size() - 1)) {
@@ -202,10 +196,7 @@ std::wstring telexConvert(const std::wstring& s) {
     return out + telexWord(cur);
 }
 
-// ---- search (EmojiIndex.search / score) ---------------------------------------------------------
 struct QWord { std::wstring exact, folded; };
-/// Every query word must start some word of one term. A hit in the emoji's name beats one in its keywords,
-/// a whole word beats a prefix, and accents count when given.
 static int score(const std::vector<QWord>& words, const std::vector<Term>& terms) {
     int total = 0; std::wstring whole; for (size_t i = 0; i < words.size(); i++) { if (i) whole += L' '; whole += words[i].folded; }
     for (auto& w : words) {
@@ -241,7 +232,6 @@ static std::vector<int> search(const std::wstring& raw, int limit) {
     std::vector<int> out; for (auto& s : scored) { if ((int)out.size() >= limit) break; out.push_back(s.i); } return out;
 }
 
-// ---- usage (EmojiUsage): each pick adds 1, older scores fade; stored as "emoji\tscore\n" lines ------------
 static const wchar_t* STARTER[] = {L"😂", L"❤️", L"🥰", L"😍", L"😭", L"👍", L"🙏", L"😊", L"🔥", L"😘", L"🤣", L"🥺", L"😅", L"🎉", L"💕", L"😁", L"🙂", L"😉",
                                    L"🤔", L"👏", L"😎", L"💪", L"✨", L"😢", L"🙌", L"💯", L"😆", L"🤗", L"😴", L"👌"};
 static std::map<std::wstring, double> usageRead() {
@@ -263,15 +253,14 @@ static std::vector<std::wstring> usageFrequent(int n) {
     if ((int)list.size() > n) list.resize(n); return list;
 }
 
-// ---- model (EmojiPickerModel) --------------------------------------------------------------------
-static const int COLS = 9; static const float CELL = 44, WIDTH = COLS * CELL + 24, HEIGHT = 404;
-static const float SEARCH_H = 14 + 24 + 8, FOOTER_H = 44, GRID_PAD = 8, GRID_X = 12;
-static const wchar_t* GROUP_VI[] = {L"Mặt cười & cảm xúc", L"Người & cơ thể", L"", L"Động vật & thiên nhiên", L"Đồ ăn & thức uống", L"Du lịch & địa điểm", L"Hoạt động", L"Đồ vật", L"Biểu tượng", L"Cờ"};
-static const wchar_t* GROUP_EN[] = {L"Smileys & Emotion", L"People & Body", L"", L"Animals & Nature", L"Food & Drink", L"Travel & Places", L"Activities", L"Objects", L"Symbols", L"Flags"};
+static const int COLS = 9; static const float CELL = 44, WIDTH = COLS * CELL + 24, HEIGHT = 412;
+static const float SEARCH_H = 48, FOOTER_H = 44, GRID_PAD = 8, GRID_X = 12;
+static const wchar_t* GROUP_VI[] = {L"MẶT CƯỜI & CẢM XÚC", L"NGƯỜI & CƠ THỂ", L"", L"ĐỘNG VẬT & THIÊN NHIÊN", L"ĐỒ ĂN & THỨC UỐNG", L"DU LỊCH & ĐỊA ĐIỂM", L"HOẠT ĐỘNG", L"ĐỒ VẬT", L"BIỂU TƯỢNG", L"CỜ"};
+static const wchar_t* GROUP_EN[] = {L"SMILEYS & EMOTION", L"PEOPLE & BODY", L"", L"ANIMALS & NATURE", L"FOOD & DRINK", L"TRAVEL & PLACES", L"ACTIVITIES", L"OBJECTS", L"SYMBOLS", L"FLAGS"};
 
 struct Row { bool header; std::wstring title; int start, count; float y, h; };
 static std::wstring _raw; static bool _allSelected = false; static bool _vietnamese = true;
-static std::vector<int> _results, _visible, _recents;   // indices into _all
+static std::vector<int> _results, _visible, _recents;
 static std::vector<Row> _rows; static float _contentH = 0, _scrollY = 0;
 static int _selected = 0; static int _tone = 0; static POINT _lastMouse = {-1, -1};
 static bool _searching() { return !trim(_raw).empty(); }
@@ -282,13 +271,13 @@ static void relayout() {
     _visible.clear(); _rows.clear(); float y = 0;
     auto add = [&](const std::wstring& title, const std::vector<int>& list) {
         if (list.empty()) return;
-        if (!title.empty()) { bool first = _rows.empty(); float h = first ? 20.0f : 28.0f; _rows.push_back({true, title, 0, 0, y, h}); y += h; }
+        if (!title.empty()) { bool first = _rows.empty(); float h = first ? 22.0f : 30.0f; _rows.push_back({true, title, 0, 0, y, h}); y += h; }
         int start = (int)_visible.size(); _visible.insert(_visible.end(), list.begin(), list.end());
         for (int i = 0; i < (int)list.size(); i += COLS) { _rows.push_back({false, L"", start + i, std::min(COLS, (int)list.size() - i), y, CELL}); y += CELL; }
     };
     if (_searching()) add(L"", _results);
     else {
-        add(_vietnamese ? L"Dùng thường xuyên" : L"Frequently Used", _recents);
+        add(_vietnamese ? L"DÙNG THƯỜNG XUYÊN" : L"FREQUENTLY USED", _recents);
         for (auto& g : _groups) if (g.first >= 0 && g.first < 10) add(_vietnamese ? GROUP_VI[g.first] : GROUP_EN[g.first], g.second);
     }
     _contentH = y;
@@ -296,7 +285,7 @@ static void relayout() {
 static int rowOf(int i) { for (int r = 0; r < (int)_rows.size(); r++) if (!_rows[r].header && i >= _rows[r].start && i < _rows[r].start + _rows[r].count) return r; return -1; }
 static float viewportH() { return HEIGHT - SEARCH_H - 1 - FOOTER_H - 1 - 2 * GRID_PAD; }
 static void clampScroll() { _scrollY = std::max(0.0f, std::min(_scrollY, std::max(0.0f, _contentH - viewportH()))); }
-static void scrollToSelected() {   // the least scrolling that shows the row; back on top shows the first title too
+static void scrollToSelected() {
     int r = rowOf(_selected); if (r < 0) return;
     int firstEmojiRow = -1; for (int i = 0; i < (int)_rows.size(); i++) if (!_rows[i].header) { firstEmojiRow = i; break; }
     if (r == firstEmojiRow) { _scrollY = 0; return; }
@@ -310,7 +299,7 @@ static void typeText(const std::wstring& s) { setRaw(_allSelected ? s : _raw + s
 static void deleteBack() { if (!_raw.empty()) { _raw.pop_back(); if (!_raw.empty() && _raw.back() >= 0xD800 && _raw.back() <= 0xDBFF) _raw.pop_back(); _allSelected = false; doSearch(); } }
 static void deleteWord() { std::wstring r = _raw; while (!r.empty() && r.back() == L' ') r.pop_back(); while (!r.empty() && r.back() != L' ') r.pop_back(); setRaw(r); }
 static void move(int d) { int n = (int)_visible.size(); if (!n) return; _selected = std::min(std::max(0, _selected + d), n - 1); scrollToSelected(); }
-static void moveRow(int d) {   // the row above/below, same column (or its last emoji)
+static void moveRow(int d) {
     int r = rowOf(_selected); if (r < 0) return;
     int t = r + d; while (t >= 0 && t < (int)_rows.size() && _rows[t].header) t += d;
     if (t < 0 || t >= (int)_rows.size()) return;
@@ -325,44 +314,64 @@ static void resetModel(bool vietnamese) {
     relayout();
 }
 
-// ---- the popup --------------------------------------------------------------------------------------
 static HINSTANCE _inst; static HWND _win; static bool _open = false; static bool _caret = true;
-static ID2D1Factory* _d2d; static IDWriteFactory* _dw; static ID2D1HwndRenderTarget* _rt;
+static ID2D1Factory* _d2d; static IDWriteFactory* _dw; static ID2D1DCRenderTarget* _rt;
 static IDWriteTextFormat *_fSearch, *_fHeader, *_fFooter, *_fEmoji, *_fEmojiFooter, *_fTone, *_fWordmark, *_fBadge, *_fEmpty;
-static ID2D1SolidColorBrush *_bText, *_bSecondary, *_bTertiary, *_bBrand, *_bBrandSoft, *_bSep, *_bBadge, *_bSelect;
+static ID2D1SolidColorBrush *_bPanel, *_bText, *_bSecondary, *_bTertiary, *_bBrand, *_bBrandInk, *_bBrandSoft, *_bEmerald, *_bSep, *_bBorder, *_bSelect;
 static float _dpi = 96;
-static const D2D1_COLOR_F BRAND = D2D1::ColorF(0x4F46E5);
 static const UINT TIMER_CARET = 1;
 
-static IDWriteTextFormat* fmt(const wchar_t* face, float size, DWRITE_FONT_WEIGHT w = DWRITE_FONT_WEIGHT_NORMAL, bool center = false) {
+static bool isDark() { return prefs::getInt(L"RezeTheme", 0) == 0; }
+
+static IDWriteTextFormat* fmt(const wchar_t* face, float size, DWRITE_FONT_WEIGHT w = DWRITE_FONT_WEIGHT_NORMAL, bool center = false, bool wrap = false) {
     IDWriteTextFormat* f = nullptr; _dw->CreateTextFormat(face, nullptr, w, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"", &f);
-    if (f) { f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP); if (center) { f->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER); } f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER); }
+    if (f) {
+        f->SetWordWrapping(wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+        if (center) f->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
     return f;
+}
+static void dropGraphics() {
+    for (auto** b : {&_bPanel, &_bText, &_bSecondary, &_bTertiary, &_bBrand, &_bBrandInk, &_bBrandSoft, &_bEmerald, &_bSep, &_bBorder, &_bSelect}) if (*b) { (*b)->Release(); *b = nullptr; }
+    if (_rt) { _rt->Release(); _rt = nullptr; }
 }
 static void ensureGraphics() {
     if (!_d2d) D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &_d2d);
     if (!_dw) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&_dw);
     if (!_fSearch && _dw) {
-        _fSearch = fmt(L"Segoe UI", 17); _fHeader = fmt(L"Segoe UI", 11, DWRITE_FONT_WEIGHT_SEMI_BOLD); _fFooter = fmt(L"Segoe UI", 13);
+        _fSearch = fmt(L"Segoe UI", 16, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        _fHeader = fmt(L"Segoe UI", 11, DWRITE_FONT_WEIGHT_BOLD);
+        _fFooter = fmt(L"Segoe UI", 13, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         if (_fFooter) { IDWriteInlineObject* sign = nullptr; _dw->CreateEllipsisTrimmingSign(_fFooter, &sign); DWRITE_TRIMMING tr = {DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0}; _fFooter->SetTrimming(&tr, sign); if (sign) sign->Release(); }
-        _fEmoji = fmt(L"Segoe UI Emoji", 28, DWRITE_FONT_WEIGHT_NORMAL, true); _fEmojiFooter = fmt(L"Segoe UI Emoji", 22); _fTone = fmt(L"Segoe UI Emoji", 18, DWRITE_FONT_WEIGHT_NORMAL, true);
-        _fWordmark = fmt(L"Segoe UI", 13, DWRITE_FONT_WEIGHT_BOLD); _fBadge = fmt(L"Segoe UI", 11, DWRITE_FONT_WEIGHT_SEMI_BOLD, true); _fEmpty = fmt(L"Segoe UI", 15, DWRITE_FONT_WEIGHT_NORMAL, true);
+        _fEmoji = fmt(L"Segoe UI Emoji", 28, DWRITE_FONT_WEIGHT_NORMAL, true);
+        _fEmojiFooter = fmt(L"Segoe UI Emoji", 22);
+        _fTone = fmt(L"Segoe UI Emoji", 18, DWRITE_FONT_WEIGHT_NORMAL, true);
+        _fWordmark = fmt(L"Segoe UI", 13, DWRITE_FONT_WEIGHT_HEAVY);
+        _fBadge = fmt(L"Consolas", 12, DWRITE_FONT_WEIGHT_BOLD, true);
+        _fEmpty = fmt(L"Segoe UI", 14, DWRITE_FONT_WEIGHT_NORMAL, true, true);
     }
-    if (!_rt && _d2d && _win) {
-        RECT rc; GetClientRect(_win, &rc);
-        _d2d->CreateHwndRenderTarget(D2D1::RenderTargetProperties(), D2D1::HwndRenderTargetProperties(_win, D2D1::SizeU(rc.right, rc.bottom)), &_rt);
+    if (!_rt && _d2d) {
+        D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            _dpi, _dpi);
+        _d2d->CreateDCRenderTarget(&props, &_rt);
         if (_rt) {
-            _rt->SetDpi(_dpi, _dpi);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(0x000000), &_bText); _rt->CreateSolidColorBrush(D2D1::ColorF(0x6E6E73), &_bSecondary);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(0xA0A0A5), &_bTertiary); _rt->CreateSolidColorBrush(BRAND, &_bBrand);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(0x4F46E5, 0.3f), &_bBrandSoft); _rt->CreateSolidColorBrush(D2D1::ColorF(0x000000, 0.1f), &_bSep);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(0x000000, 0.07f), &_bBadge); _rt->CreateSolidColorBrush(D2D1::ColorF(0x4F46E5, 0.22f), &_bSelect);
+            bool dark = isDark();
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x121926 : 0xFFFFFF), &_bPanel);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0xF2F5FA : 0x0D1321), &_bText);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0xA6B4C9 : 0x3E4C63), &_bSecondary);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x8FA2BD : 0x526077), &_bTertiary);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x38BDF8 : 0x1D4ED8), &_bBrand);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x0B0F17 : 0xFFFFFF), &_bBrandInk);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x38BDF8 : 0x1D4ED8, 0.25f), &_bBrandSoft);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x34D399 : 0x047857), &_bEmerald);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x263348 : 0xCBD5E1), &_bSep);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x647894 : 0x6E7F99), &_bBorder);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x192B42 : 0xDBEAFE), &_bSelect);
         }
     }
-}
-static void dropGraphics() {
-    for (auto** b : {&_bText, &_bSecondary, &_bTertiary, &_bBrand, &_bBrandSoft, &_bSep, &_bBadge, &_bSelect}) if (*b) { (*b)->Release(); *b = nullptr; }
-    if (_rt) { _rt->Release(); _rt = nullptr; }
 }
 static float textWidth(const std::wstring& s, IDWriteTextFormat* f) {
     if (s.empty() || !_dw) return 0; IDWriteTextLayout* l = nullptr; _dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), f, 10000, 100, &l); if (!l) return 0;
@@ -371,67 +380,99 @@ static float textWidth(const std::wstring& s, IDWriteTextFormat* f) {
 static void text(const std::wstring& s, IDWriteTextFormat* f, D2D1_RECT_F r, ID2D1Brush* b) { if (!s.empty()) _rt->DrawTextW(s.c_str(), (UINT32)s.size(), f, r, b, (D2D1_DRAW_TEXT_OPTIONS)(D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT | D2D1_DRAW_TEXT_OPTIONS_CLIP)); }
 static float gridTop() { return SEARCH_H + 1 + GRID_PAD; }
 static D2D1_RECT_F cellRect(const Row& r, int c) { float x = GRID_X + c * CELL, y = gridTop() + r.y - _scrollY; return D2D1::RectF(x, y, x + CELL, y + CELL); }
-static D2D1_RECT_F toneRect() { return D2D1::RectF(WIDTH - 14 - 28, HEIGHT - FOOTER_H + 8, WIDTH - 14, HEIGHT - 8); }
+static D2D1_RECT_F toneRect() { return D2D1::RectF(WIDTH - 12 - 30, HEIGHT - FOOTER_H + 7, WIDTH - 12, HEIGHT - 7); }
 
-static void paint() {
-    ensureGraphics(); if (!_rt) return;
+static void applyWindowFrame() {
+    if (!_win) return;
+    DWORD corner = 1; // DWMWCP_DONOTROUND: zero rounded corners
+    DwmSetWindowAttribute(_win, 33, &corner, sizeof(corner));
+    COLORREF border = isDark() ? RGB(100, 120, 148) : RGB(110, 127, 153);
+    DwmSetWindowAttribute(_win, 34, &border, sizeof(border));
+}
+
+static void paint(HDC targetDc) {
+    ensureGraphics(); if (!_rt || !_win) return;
+    RECT rc; GetClientRect(_win, &rc);
+    HDC mem = CreateCompatibleDC(targetDc);
+    HBITMAP bmp = CreateCompatibleBitmap(targetDc, rc.right, rc.bottom);
+    HGDIOBJ old = SelectObject(mem, bmp);
+    _rt->BindDC(mem, &rc);
     _rt->BeginDraw();
-    _rt->Clear(D2D1::ColorF(0xF7F7F8));
-    // search field: magnifier, the query (Telex-read in Vietnamese mode), caret, placeholder, VI/EN badge
-    float sx = 14, sy = 14, sh = 24;
-    _rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(sx + 7, sy + 10), 5.5f, 5.5f), _bSecondary, 1.6f);
-    _rt->DrawLine(D2D1::Point2F(sx + 11, sy + 14), D2D1::Point2F(sx + 16, sy + 19), _bSecondary, 1.8f);
+    _rt->Clear(D2D1::ColorF(isDark() ? 0x0B0F17 : 0xEDF2F9));
+    // Sharp top search bar panel with Reze choker-pin accent strip
+    _rt->FillRectangle(D2D1::RectF(0, 0, WIDTH, SEARCH_H), _bPanel);
+    _rt->FillRectangle(D2D1::RectF(0, 0, 4, SEARCH_H), _bBrand);
+    float sx = 16, sy = 12, sh = 24;
+    // Magnifier with choker pin ring geometry
+    _rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(sx + 7, sy + 10), 5.5f, 5.5f), _bBrand, 1.8f);
+    _rt->DrawLine(D2D1::Point2F(sx + 11, sy + 14), D2D1::Point2F(sx + 16, sy + 19), _bBrand, 2.0f);
     float tx = sx + 26; std::wstring disp = _display(); float tw = textWidth(disp, _fSearch);
-    float badgeW = 26; D2D1_RECT_F badge = D2D1::RectF(WIDTH - 14 - badgeW, sy + 4, WIDTH - 14, sy + sh - 4);
-    if (_allSelected && !disp.empty()) _rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tx - 1, sy + 1, tx + tw + 1, sy + sh - 1), 3, 3), _bBrandSoft);
+    float badgeW = 34; D2D1_RECT_F badge = D2D1::RectF(WIDTH - 12 - badgeW, sy + 2, WIDTH - 12, sy + sh - 2);
+    if (_allSelected && !disp.empty()) _rt->FillRectangle(D2D1::RectF(tx - 1, sy + 1, tx + tw + 1, sy + sh - 1), _bBrandSoft);
     text(disp, _fSearch, D2D1::RectF(tx, sy, badge.left - 8, sy + sh), _bText);
-    if (_caret && !_allSelected) _rt->FillRectangle(D2D1::RectF(tx + tw + 1, sy + 3, tx + tw + 3, sy + sh - 3), _bBrand);
-    if (_raw.empty()) text(_vietnamese ? L"Tìm emoji: ngựa, horse…" : L"Search emoji: horse, ngựa…", _fSearch, D2D1::RectF(tx + 4, sy, badge.left - 8, sy + sh), _bTertiary);
-    _rt->FillRoundedRectangle(D2D1::RoundedRect(badge, 5, 5), _bBadge);
-    text(_vietnamese ? L"VI" : L"EN", _fBadge, badge, _bSecondary);
-    _rt->FillRectangle(D2D1::RectF(0, SEARCH_H, WIDTH, SEARCH_H + 1), _bSep);
-    // grid
+    if (_caret && !_allSelected) _rt->FillRectangle(D2D1::RectF(tx + tw + 1, sy + 3, tx + tw + 3, sy + sh - 3), _bEmerald);
+    if (_raw.empty()) text(_vietnamese ? L"Tìm emoji: ngựa, horse, cười…" : L"Search emoji: horse, ngựa, smile…", _fSearch, D2D1::RectF(tx + 4, sy, badge.left - 8, sy + sh), _bTertiary);
+    // Sharp rectangular language badge
+    _rt->FillRectangle(badge, _bBrand);
+    text(_vietnamese ? L"VI" : L"EN", _fBadge, badge, _bBrandInk);
+    _rt->FillRectangle(D2D1::RectF(0, SEARCH_H, WIDTH, SEARCH_H + 1), _bBorder);
+
+    // Emoji grid viewport
     float gt = SEARCH_H + 1, gb = HEIGHT - FOOTER_H - 1;
-    _rt->PushAxisAlignedClip(D2D1::RectF(0, gt + GRID_PAD, WIDTH, gb - GRID_PAD), D2D1_ANTIALIAS_MODE_ALIASED);   // the scrolling area itself is inset (Tony)
-    if (_searching() && _results.empty()) text(_vietnamese ? L"Không tìm thấy emoji nào" : L"No emoji found", _fEmpty, D2D1::RectF(0, gt + 100, WIDTH, gt + 140), _bSecondary);
+    _rt->PushAxisAlignedClip(D2D1::RectF(0, gt + GRID_PAD, WIDTH, gb - GRID_PAD), D2D1_ANTIALIAS_MODE_ALIASED);
+    if (_searching() && _results.empty()) {
+        D2D1_RECT_F er = D2D1::RectF(24, gt + 84, WIDTH - 24, gt + 170);
+        _rt->FillRectangle(er, _bPanel);
+        _rt->DrawRectangle(er, _bBorder, 1.0f);
+        text(_vietnamese ? L"Không khớp từ khoá nào.\nThử từ khác (cười, tim, mèo) hoặc bấm Esc để xoá bộ lọc."
+                         : L"No matching emoji.\nTry another keyword (smile, heart, cat) or press Esc to clear.", _fEmpty, er, _bSecondary);
+    }
     for (auto& r : _rows) {
         float y = gridTop() + r.y - _scrollY; if (y + r.h < gt || y > gb) continue;
-        if (r.header) { float pad = r.h - 20; text(r.title, _fHeader, D2D1::RectF(GRID_X, y + pad, WIDTH - GRID_X, y + pad + 14), _bSecondary); continue; }
+        if (r.header) {
+            float pad = r.h - 20;
+            _rt->FillRectangle(D2D1::RectF(GRID_X, y + pad + 3, GRID_X + 6, y + pad + 11), _bBrand);
+            text(r.title, _fHeader, D2D1::RectF(GRID_X + 12, y + pad, WIDTH - GRID_X, y + pad + 14), _bSecondary);
+            continue;
+        }
         for (int c = 0; c < r.count; c++) {
             int idx = r.start + c; D2D1_RECT_F cr = cellRect(r, c);
-            if (idx == _selected) _rt->FillRoundedRectangle(D2D1::RoundedRect(cr, 8, 8), _bSelect);
+            if (idx == _selected) {
+                D2D1_RECT_F sr = D2D1::RectF(cr.left + 1, cr.top + 1, cr.right - 1, cr.bottom - 1);
+                _rt->FillRectangle(sr, _bSelect);
+                _rt->DrawRectangle(sr, _bBrand, 1.5f);
+                // Brutalist corner tick marks
+                _rt->FillRectangle(D2D1::RectF(sr.left, sr.top, sr.left + 6, sr.top + 2), _bEmerald);
+                _rt->FillRectangle(D2D1::RectF(sr.left, sr.top, sr.left + 2, sr.top + 6), _bEmerald);
+                _rt->FillRectangle(D2D1::RectF(sr.right - 6, sr.bottom - 2, sr.right, sr.bottom), _bEmerald);
+                _rt->FillRectangle(D2D1::RectF(sr.right - 2, sr.bottom - 6, sr.right, sr.bottom), _bEmerald);
+            }
             text(_all[_visible[idx]].withSkin(_tone), _fEmoji, cr, _bText);
         }
     }
     _rt->PopAxisAlignedClip();
-    _rt->FillRectangle(D2D1::RectF(0, gb, WIDTH, gb + 1), _bSep);
-    // footer: the selected emoji and its name, the brand, the skin tone
+    _rt->FillRectangle(D2D1::RectF(0, gb, WIDTH, gb + 1), _bBorder);
+
+    // Sharp footer bar
     float fy = HEIGHT - FOOTER_H;
+    _rt->FillRectangle(D2D1::RectF(0, fy, WIDTH, HEIGHT), _bPanel);
     if (const Emoji* e = _current()) {
-        text(e->withSkin(_tone), _fEmojiFooter, D2D1::RectF(14, fy, 14 + 32, HEIGHT), _bText);
-        text(_vietnamese ? e->nameVI : e->nameEN, _fFooter, D2D1::RectF(14 + 32 + 6, fy, WIDTH - 140, HEIGHT), _bSecondary);
+        text(e->withSkin(_tone), _fEmojiFooter, D2D1::RectF(12, fy, 12 + 32, HEIGHT), _bText);
+        text(_vietnamese ? e->nameVI : e->nameEN, _fFooter, D2D1::RectF(12 + 32 + 6, fy, WIDTH - 144, HEIGHT), _bSecondary);
     }
     D2D1_RECT_F tr = toneRect();
+    _rt->DrawRectangle(tr, _bBorder, 1.0f);
     static const wchar_t* HANDS[] = {L"✋", L"✋🏻", L"✋🏼", L"✋🏽", L"✋🏾", L"✋🏿"};
     text(HANDS[_tone], _fTone, tr, _bText);
-    _rt->FillRectangle(D2D1::RectF(tr.left - 10, fy + 14, tr.left - 9, HEIGHT - 14), _bSep);
-    float wx = tr.left - 10 - 10; float keyW = textWidth(L"key", _fWordmark), viW = textWidth(L"Vi", _fWordmark);
+    _rt->FillRectangle(D2D1::RectF(tr.left - 10, fy + 10, tr.left - 9, HEIGHT - 10), _bSep);
+    float wx = tr.left - 18; float keyW = textWidth(L"key", _fWordmark), viW = textWidth(L"Vi", _fWordmark);
     text(L"key", _fWordmark, D2D1::RectF(wx - keyW, fy, wx, HEIGHT), _bBrand); wx -= keyW;
-    text(L"Vi", _fWordmark, D2D1::RectF(wx - viW, fy, wx, HEIGHT), _bText); wx -= viW + 5;
-    HICON icon = (HICON)LoadImageW(_inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
-    if (icon) {   // the app icon through GDI on the same surface, after D2D is done with this frame
-        ICONINFO ii; if (GetIconInfo(icon, &ii)) {
-            BITMAP bm; GetObject(ii.hbmColor, sizeof(bm), &bm); std::vector<DWORD> px(bm.bmWidth * bm.bmHeight);
-            BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = bm.bmWidth; bi.bmiHeader.biHeight = -bm.bmHeight; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-            HDC dc = GetDC(nullptr); GetDIBits(dc, ii.hbmColor, 0, bm.bmHeight, px.data(), &bi, DIB_RGB_COLORS); ReleaseDC(nullptr, dc);
-            for (auto& p : px) { BYTE a = p >> 24; if (a && a < 255) { BYTE r = (BYTE)(((p >> 16) & 255) * a / 255), g = (BYTE)(((p >> 8) & 255) * a / 255), b = (BYTE)((p & 255) * a / 255); p = (a << 24) | (r << 16) | (g << 8) | b; } }
-            ID2D1Bitmap* bmp = nullptr; _rt->CreateBitmap(D2D1::SizeU(bm.bmWidth, bm.bmHeight), px.data(), bm.bmWidth * 4, D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)), &bmp);
-            if (bmp) { _rt->DrawBitmap(bmp, D2D1::RectF(wx - 16, fy + 14, wx, fy + 30), 0.85f); bmp->Release(); }
-            DeleteObject(ii.hbmColor); DeleteObject(ii.hbmMask);
-        }
-        DestroyIcon(icon);
-    }
+    text(L"Vi", _fWordmark, D2D1::RectF(wx - viW, fy, wx, HEIGHT), _bText);
+    // Outer 1px frame
+    _rt->DrawRectangle(D2D1::RectF(0.5f, 0.5f, WIDTH - 0.5f, HEIGHT - 0.5f), _bBorder, 1.0f);
     if (_rt->EndDraw() == D2DERR_RECREATE_TARGET) dropGraphics();
+    BitBlt(targetDc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
 }
 
 static void choose(const Emoji* e) {
@@ -440,23 +481,28 @@ static void choose(const Emoji* e) {
     close();
     core::insertText(t);
 }
-static int cellAt(int px, int py) {   // index of the emoji under the point (client pixels), -1 if none
+static int cellAt(int px, int py) {
     float x = px * 96.0f / _dpi, y = py * 96.0f / _dpi;
     if (y < SEARCH_H + 1 || y > HEIGHT - FOOTER_H - 1) return -1;
     for (auto& r : _rows) { if (r.header) continue; float ry = gridTop() + r.y - _scrollY; if (y >= ry && y < ry + r.h) { int c = (int)((x - GRID_X) / CELL); return x >= GRID_X && c < r.count ? r.start + c : -1; } }
     return -1;
 }
+static bool inToneRect(int px, int py) {
+    float x = px * 96.0f / _dpi, y = py * 96.0f / _dpi;
+    D2D1_RECT_F tr = toneRect();
+    return x >= tr.left - 4 && x <= tr.right + 4 && y >= tr.top - 4 && y <= tr.bottom + 4;
+}
 static wchar_t charFor(DWORD vk, unsigned flags) {
     BYTE ks[256] = {}; if (flags & 1) ks[VK_SHIFT] = 0x80; if (flags & 16) ks[VK_CAPITAL] = 1;
-    if ((flags & 6) == 6) ks[VK_CONTROL] = ks[VK_MENU] = 0x80;   // AltGr (Ctrl+Alt): @ on German, ł on Polish
+    if ((flags & 6) == 6) ks[VK_CONTROL] = ks[VK_MENU] = 0x80;
     wchar_t buf[8] = {}; HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), nullptr));
     int n = ToUnicodeEx(vk, MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC, hkl), ks, buf, 8, 1 << 2, hkl);
     return n == 1 && buf[0] >= 0x20 ? buf[0] : 0;
 }
-static void onKey(DWORD vk, unsigned flags) {   // from the keyboard hook (WM_APP+10; Windows' shortcuts and media keys don't come here); EmojiPanel.keyDown
+static void onKey(DWORD vk, unsigned flags) {
     bool ctrl = flags & 2, alt = flags & 4, win = flags & 8;
     switch (vk) {
-    case VK_ESCAPE: if (_raw.empty()) close(); else setRaw(L""); break;   // Esc: clears the search, then closes
+    case VK_ESCAPE: if (_raw.empty()) close(); else setRaw(L""); break;
     case VK_RETURN: choose(_current()); return;
     case VK_LEFT: _allSelected = false; move(-1); break;
     case VK_RIGHT: _allSelected = false; move(1); break;
@@ -478,24 +524,28 @@ static void onKey(DWORD vk, unsigned flags) {   // from the keyboard hook (WM_AP
 }
 static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-    case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(h, &ps); paint(); EndPaint(h, &ps); return 0; }
+    case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); paint(dc); EndPaint(h, &ps); return 0; }
+    case WM_PRINTCLIENT: paint((HDC)w); return 0;
     case WM_ERASEBKGND: return 1;
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_APP + 10: onKey((DWORD)w, (unsigned)l); return 0;
     case WM_APP + 11: close(); return 0;
     case WM_APP + 12: if (w >= 0x20) { typeText(std::wstring(1, (wchar_t)w)); InvalidateRect(h, nullptr, FALSE); } return 0;
     case WM_TIMER: if (w == TIMER_CARET) { _caret = !_caret; InvalidateRect(h, nullptr, FALSE); } return 0;
-    case WM_MOUSEMOVE: {   // hover selects only when the mouse really moved (not when the grid scrolled under it)
+    case WM_MOUSEMOVE: {
         POINT p; GetCursorPos(&p); if (p.x == _lastMouse.x && p.y == _lastMouse.y) return 0; _lastMouse = p;
         int i = cellAt(GET_X_LPARAM(l), GET_Y_LPARAM(l)); if (i >= 0 && i != _selected) { _selected = i; InvalidateRect(h, nullptr, FALSE); }
         return 0; }
     case WM_LBUTTONDOWN: {
-        float x = GET_X_LPARAM(l) * 96.0f / _dpi, y = GET_Y_LPARAM(l) * 96.0f / _dpi; D2D1_RECT_F tr = toneRect();
-        if (x >= tr.left - 4 && x <= tr.right + 4 && y >= tr.top - 4) { _tone = (_tone + 1) % 6; prefs::setInt(L"EmojiSkinTone", _tone); InvalidateRect(h, nullptr, FALSE); return 0; }
+        if (inToneRect(GET_X_LPARAM(l), GET_Y_LPARAM(l))) { _tone = (_tone + 1) % 6; prefs::setInt(L"EmojiSkinTone", _tone); InvalidateRect(h, nullptr, FALSE); return 0; }
         int i = cellAt(GET_X_LPARAM(l), GET_Y_LPARAM(l)); if (i >= 0) { _selected = i; choose(_current()); }
         return 0; }
     case WM_MOUSEWHEEL: { _scrollY -= GET_WHEEL_DELTA_WPARAM(w) / (float)WHEEL_DELTA * CELL; clampScroll(); InvalidateRect(h, nullptr, FALSE); return 0; }
-    case WM_SETCURSOR: SetCursor(LoadCursor(nullptr, IDC_ARROW)); return TRUE;
+    case WM_SETCURSOR: {
+        POINT p; GetCursorPos(&p); ScreenToClient(h, &p);
+        bool clickable = cellAt(p.x, p.y) >= 0 || inToneRect(p.x, p.y);
+        SetCursor(LoadCursor(nullptr, clickable ? IDC_HAND : IDC_ARROW));
+        return TRUE; }
     case WM_DPICHANGED: _dpi = (float)HIWORD(w); dropGraphics(); return 0;
     case WM_DESTROY: dropGraphics(); _win = nullptr; return 0;
     }
@@ -506,8 +556,7 @@ static void prepare() {
     static bool reg = false;
     if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = proc; wc.hInstance = _inst; wc.lpszClassName = L"VikeyEmoji"; wc.style = CS_DROPSHADOW; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&wc); reg = true; }
     _win = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"VikeyEmoji", L"Vikey Emoji", WS_POPUP, 0, 0, (int)WIDTH, (int)HEIGHT, nullptr, nullptr, _inst, nullptr);
-    DWORD pref = 2 /* DWMWCP_ROUND */; DwmSetWindowAttribute(_win, 33 /* DWMWA_WINDOW_ROUNDED_PREFERENCE */, &pref, sizeof(pref));
-    COLORREF border = RGB(214, 214, 218); DwmSetWindowAttribute(_win, 34 /* DWMWA_BORDER_COLOR */, &border, sizeof(border));
+    applyWindowFrame();
 }
 
 void install(HINSTANCE inst) {
@@ -516,10 +565,16 @@ void install(HINSTANCE inst) {
     settingsChanged();
 }
 void settingsChanged() { if (prefs::getInt(L"EmojiPicker", 0)) prepare(); }
+void themeChanged() {
+    applyWindowFrame();
+    dropGraphics();
+    if (_win && _open) InvalidateRect(_win, nullptr, FALSE);
+}
 bool isOpen() { return _open; }
 void toggle() { _open ? close() : open(); }
 void open() {
     loadIndex(); prepare(); if (!_win) return;
+    applyWindowFrame();
     resetModel(core::language() == 1);
     POINT p; GetCursorPos(&p); HMONITOR mon = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST); MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(mon, &mi);
     UINT dpi = GetDpiForWindow(_win); _dpi = (float)dpi; float s = dpi / 96.0f;
@@ -538,4 +593,4 @@ void close() {
 }
 void languageChanged(int lang) { if (_vietnamese != (lang == 1)) { _vietnamese = lang == 1; if (_open) { doSearch(); InvalidateRect(_win, nullptr, FALSE); } } }
 
-}} // namespace
+}}

@@ -38,7 +38,6 @@ static Release _found;                 // the newer release the last check found
 static std::wstring _pendingPath;      // a downloaded + verified installer
 static std::wstring _lastError;
 
-// ---- helpers -------------------------------------------------------------------------------------
 static std::vector<unsigned char> b64decode(const std::string& s) {
     static const std::string T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::vector<unsigned char> out; int val = 0, bits = -8;
@@ -75,12 +74,11 @@ static std::wstring stripHtml(const std::string& html) {
     std::wstring w = widen(out); while (!w.empty() && iswspace(w.front())) w.erase(0, 1); while (!w.empty() && iswspace(w.back())) w.pop_back(); return w;
 }
 
-// ---- HTTP (WinHTTP) ------------------------------------------------------------------------------
 static bool httpGet(const std::wstring& url, std::vector<unsigned char>& out, unsigned long long maxBytes = 200ull << 20) {
     out.clear();
     URL_COMPONENTS uc = {sizeof(uc)}; wchar_t host[256], path[2048]; uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = path; uc.dwUrlPathLength = 2048;
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return false;
-    HINTERNET s = WinHttpOpen(L"Vikey/" VIKEY_VERSION, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET s = WinHttpOpen(L"Vikey/" VIKEY_VERSION_W, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!s) return false;
     bool ok = false;
     HINTERNET c = WinHttpConnect(s, host, uc.nPort, 0);
@@ -101,7 +99,6 @@ static bool httpGet(const std::wstring& url, std::vector<unsigned char>& out, un
     return ok;
 }
 
-// ---- feed -------------------------------------------------------------------------------------
 static std::wstring feedUrl() { std::wstring u = prefs::getString(L"AppcastURL", L""); return u.empty() ? DEFAULT_FEED : u; }
 /// The newest Windows release for this architecture in the feed; false when the feed has none.
 static bool newestInFeed(const std::string& xml, Release& best) {
@@ -141,7 +138,7 @@ static bool download(const Release& r) {
     if (!httpGet(r.url, file)) { _lastError = L"Không tải được bản cập nhật."; return false; }
     if (r.length && file.size() != r.length) { _lastError = L"File tải về không đúng kích thước."; return false; }
     if (!verify(file, r.signature)) { _lastError = L"Chữ ký của bản cập nhật không hợp lệ."; return false; }
-    std::ofstream f(path, std::ios::binary); f.write((const char*)file.data(), file.size()); f.close();
+    std::ofstream f(path.c_str(), std::ios::binary); f.write((const char*)file.data(), file.size()); f.close();
     if (!f) { _lastError = L"Không ghi được file cập nhật."; return false; }
     rememberPending(path, r.version);
     return true;
@@ -152,7 +149,6 @@ static bool runInstaller(const std::wstring& path, bool silent) {
     return (INT_PTR)h > 32;
 }
 
-// ---- checks ---------------------------------------------------------------------------------------
 static void checkThread(bool manual) {
     std::vector<unsigned char> xml; Event ev = EvFailed;
     if (httpGet(feedUrl(), xml, 4 << 20)) {

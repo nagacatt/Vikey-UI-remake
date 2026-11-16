@@ -25,4 +25,4 @@ void setLaunchAtLogin(bool on);
 /// Settings from an OpenKey install (HKCU\SOFTWARE\TuyenMai\OpenKey), copied once.
 void migrateFromOpenKey();
 
-}} // namespace
+}}

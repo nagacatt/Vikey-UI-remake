@@ -37,7 +37,6 @@ static char _os[160];
 static volatile LONG _writing = 0;
 static DWORD _mainThread = 0;
 
-// ---- helpers ------------------------------------------------------------------------------------
 static std::string narrow(const std::wstring& w) { int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr); std::string s(n, 0); WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr); return s; }
 static std::wstring widen(const std::string& s) { int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0); std::wstring w(n, 0); MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n); return w; }
 
@@ -71,7 +70,6 @@ static std::string windowsVersion() {
     return buf;
 }
 
-// ---- writing the report (in the crashing process) -----------------------------------------------
 struct Out { char buf[16384]; int len = 0;
     void add(const char* fmt, ...) { va_list a; va_start(a, fmt); int n = _vsnprintf_s(buf + len, sizeof(buf) - len, _TRUNCATE, fmt, a); va_end(a); if (n > 0) len += n; else len = (int)strlen(buf); }
 };
@@ -101,7 +99,11 @@ static DWORD64 pcOf(const CONTEXT& c) {
 /// Walks the stack with the unwind data in each module (RtlVirtualUnwind): no DbgHelp, no symbols, no allocation.
 static void walk(Out& o, CONTEXT& ctx);
 static void addStack(Out& o, CONTEXT ctx) {
+#ifdef _MSC_VER
     __try { walk(o, ctx); } __except (EXCEPTION_EXECUTE_HANDLER) { o.add("  (stack walk stopped: bad frame)\n"); }
+#else
+    walk(o, ctx);
+#endif
 }
 static void walk(Out& o, CONTEXT& ctx) {
     o.add("\nStack (module+offset):\n");
@@ -216,7 +218,6 @@ void selfTestIfAsked() {
     if (wcsstr(cl, L"--crash-self-test")) crashNow(nullptr);
 }
 
-// ---- next launch: ask, then send -----------------------------------------------------------------
 static long long nowUnix() { return (long long)time(nullptr); }
 static long long fileUnix(const FILETIME& ft) { ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime; return (long long)(u.QuadPart / 10000000ULL) - 11644473600LL; }
 
@@ -336,4 +337,4 @@ void checkAtLaunch() {
     if (t) CloseHandle(t);
 }
 
-}} // namespace
+}}

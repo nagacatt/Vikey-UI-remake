@@ -1,4 +1,4 @@
-// Vikey for Windows: tray icon (V / E), menu, and the message loop the hooks need.
+// Vikey for Windows: tray icon (V / E), context menu, and the message loop driving low-level hooks.
 #include <windows.h>
 #include <shellapi.h>
 #include <string>
@@ -20,15 +20,15 @@
 
 static const UINT WM_TRAY = WM_APP + 1;
 static const UINT WM_VIKEY_SETLANG = WM_APP + 2;   // tests: wParam = language (0 English, 1 Vietnamese)
-static const UINT WM_VIKEY_EMOJI = WM_APP + 5;     // the emoji hotkey, posted from the keyboard hook
-static const UINT WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");   // Explorer (re)started: the tray is empty
+static const UINT WM_VIKEY_EMOJI = WM_APP + 5;     // posted from the keyboard hook when the emoji shortcut fires
+static const UINT WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
 static const UINT TIMER_FLUSH = 1;
-enum { ID_VIET = 100, ID_ENG, ID_SETTINGS, ID_AUTOSWITCH, ID_UPDATE, ID_LOGTOGGLE, ID_LOG, ID_ABOUT, ID_QUIT, ID_FEEDBACK, ID_GUIDE };
+enum { ID_VIET = 100, ID_ENG, ID_SETTINGS, ID_AUTOSWITCH, ID_THEME, ID_UPDATE, ID_LOGTOGGLE, ID_LOG, ID_ABOUT, ID_QUIT, ID_FEEDBACK, ID_GUIDE };
 
 static HWND _hwnd; static NOTIFYICONDATAW _nid = {};
 static HICON _iconV, _iconE;
 
-/// Draws the menu-bar glyph: a rounded square with a V or E cut out, like the macOS icon.
+/// Draws the tray badge: a sharp brutalist square with a corner notch and a cut-out V or E.
 static HICON makeIcon(wchar_t letter, bool dark) {
     const int S = 32;
     HDC dc = CreateCompatibleDC(nullptr);
@@ -36,15 +36,25 @@ static HICON makeIcon(wchar_t letter, bool dark) {
     void* bits = nullptr; HBITMAP color = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HGDIOBJ old = SelectObject(dc, color);
     DWORD* px = (DWORD*)bits; for (int i = 0; i < S * S; i++) px[i] = 0;
-    COLORREF fg = dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
+    COLORREF fg = dark ? RGB(242, 245, 250) : RGB(13, 19, 33);
     HBRUSH b = CreateSolidBrush(fg); HPEN p = CreatePen(PS_NULL, 0, 0);
     SelectObject(dc, b); SelectObject(dc, p);
-    RoundRect(dc, 2, 3, S - 2, S - 3, 10, 10);
-    HFONT f = CreateFontW(-22, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    Rectangle(dc, 2, 2, S - 2, S - 2);
+    HFONT f = CreateFontW(-22, 0, 0, 0, FW_HEAVY, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     SelectObject(dc, f); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(1, 2, 3));
-    RECT r = {0, 1, S, S}; DrawTextW(dc, &letter, 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    // punch the letter out: pixels drawn in the marker color become transparent; the rest opaque
-    for (int i = 0; i < S * S; i++) { DWORD c = px[i] & 0xFFFFFF; if (c == 0x030201) px[i] = 0; else if (c != 0) px[i] |= 0xFF000000; else px[i] = 0; }
+    RECT r = {0, 0, S, S}; DrawTextW(dc, &letter, 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    // Punch the letter out and add a 4x4 Reze cyan/emerald corner marker at top-right.
+    DWORD accent = (letter == L'V') ? 0xFF38BDF8 : 0xFF34D399;
+    for (int y = 0; y < S; y++) {
+        for (int x = 0; x < S; x++) {
+            int i = y * S + x;
+            DWORD c = px[i] & 0xFFFFFF;
+            if (x >= S - 7 && x < S - 2 && y >= 2 && y < 7) px[i] = accent;
+            else if (c == 0x030201) px[i] = 0;
+            else if (c != 0) px[i] |= 0xFF000000;
+            else px[i] = 0;
+        }
+    }
     SelectObject(dc, old); DeleteObject(f); DeleteObject(b); DeleteObject(p); DeleteDC(dc);
     HBITMAP mask = CreateBitmap(S, S, 1, 1, nullptr);
     ICONINFO ii = {TRUE, 0, 0, mask, color}; HICON h = CreateIconIndirect(&ii);
@@ -57,7 +67,7 @@ static bool darkTaskbar() {
 }
 static void updateTray(int lang) {
     _nid.hIcon = lang ? _iconV : _iconE;
-    wcscpy_s(_nid.szTip, lang ? L"Vikey – Tiếng Việt" : L"Vikey – English");
+    wcscpy_s(_nid.szTip, lang ? L"Vikey: Tiếng Việt" : L"Vikey: English");
     Shell_NotifyIconW(NIM_MODIFY, &_nid);
 }
 static void toggle(const wchar_t* key, int fallback) { vikey::prefs::setInt(key, !vikey::prefs::getInt(key, fallback)); vikey::core::reloadSettings(); }
@@ -72,26 +82,27 @@ static void showMenu() {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING | (core::language() ? MF_CHECKED : 0), ID_VIET, (L"Tiếng Việt\t" + hotkeyLabel()).c_str());
     AppendMenuW(m, MF_STRING | (prefs::getInt(L"AutoSwitchByTyping", 1) ? MF_CHECKED : 0), ID_AUTOSWITCH, L"Tự chuyển Anh/Việt");
+    AppendMenuW(m, MF_STRING | (ui::isDarkTheme() ? MF_CHECKED : 0), ID_THEME, L"Chế độ Đêm (Reze Nocturne)");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, ID_SETTINGS, L"Mở Vikey…");
+    AppendMenuW(m, MF_STRING, ID_SETTINGS, L"Mở bảng điều khiển Vikey…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, ID_GUIDE, L"Hướng dẫn…");
+    AppendMenuW(m, MF_STRING, ID_GUIDE, L"Hướng dẫn sử dụng…");
     AppendMenuW(m, MF_STRING, ID_FEEDBACK, L"Gửi góp ý…");
     AppendMenuW(m, MF_STRING, ID_UPDATE, L"Kiểm tra cập nhật…");
     AppendMenuW(m, MF_STRING, ID_ABOUT, L"Giới thiệu Vikey");
     HMENU dbg = CreatePopupMenu();
     AppendMenuW(dbg, MF_STRING | (prefs::getInt(L"TypingLogEnabled", 0) ? MF_CHECKED : 0), ID_LOGTOGGLE, L"Ghi nhật ký gõ");
-    AppendMenuW(dbg, MF_STRING | (prefs::getInt(L"TypingLogEnabled", 0) ? 0 : MF_GRAYED), ID_LOG, L"Xem nhật ký gõ…");
+    AppendMenuW(dbg, MF_STRING, ID_LOG, L"Xem nhật ký gõ…");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)dbg, L"Gỡ lỗi");
     AppendMenuW(m, MF_STRING, ID_QUIT, L"Thoát Vikey");
     POINT pt; GetCursorPos(&pt); SetForegroundWindow(_hwnd);
     TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, _hwnd, nullptr);
-    PostMessageW(_hwnd, WM_NULL, 0, 0);   // or the next menu vanishes at once (TrackPopupMenu remarks)
+    PostMessageW(_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
 }
 static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     using namespace vikey;
-    if (WM_TASKBARCREATED && msg == WM_TASKBARCREATED) { Shell_NotifyIconW(NIM_ADD, &_nid); return 0; }   // put the icon back (_nid has the current one)
+    if (WM_TASKBARCREATED && msg == WM_TASKBARCREATED) { Shell_NotifyIconW(NIM_ADD, &_nid); return 0; }
     switch (msg) {
     case WM_TRAY:
         if (LOWORD(lp) == WM_LBUTTONUP) ui::showSettings(GetModuleHandleW(nullptr), false);
@@ -101,6 +112,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case ID_VIET: core::setLanguageByUser(!core::language()); break;
         case ID_AUTOSWITCH: toggle(L"AutoSwitchByTyping", 1); break;
+        case ID_THEME: ui::toggleTheme(); break;
         case ID_SETTINGS: ui::showSettings(GetModuleHandleW(nullptr), false); break;
         case ID_UPDATE: updater::checkNow(h); break;
         case ID_ABOUT: ui::showAbout(GetModuleHandleW(nullptr)); break;
@@ -118,7 +130,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER: if (wp == TIMER_FLUSH) core::flushTypingLog(); return 0;
     case site::WM_SITE: { HWND w; std::wstring host = site::lastHost(&w); if (w == GetForegroundWindow()) core::onSiteChanged(host); return 0; }
     case WM_SETTINGCHANGE: {
-        if (!lp || wcscmp((LPCWSTR)lp, L"ImmersiveColorSet") != 0) return 0;   // a theme change: every other setting broadcast is ignored
+        if (!lp || wcscmp((LPCWSTR)lp, L"ImmersiveColorSet") != 0) return 0;
         bool dark = darkTaskbar(); DestroyIcon(_iconV); DestroyIcon(_iconE); _iconV = makeIcon(L'V', dark); _iconE = makeIcon(L'E', dark); updateTray(core::language()); return 0; }
     case WM_DESTROY: core::stop(); Shell_NotifyIconW(NIM_DELETE, &_nid); PostQuitMessage(0); return 0;
     }
@@ -126,21 +138,19 @@ static LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
-    vikey::crash::install();           // a crash leaves a text report (no typed text) for the next launch
-    vikey::crash::selfTestIfAsked();   // hidden: --crash-self-test
+    vikey::crash::install();
+    vikey::crash::selfTestIfAsked();
     HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\VikeyRunning");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {   // already running: opening the app again shows its window, like on macOS
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND t = FindWindowW(L"VikeyTray", nullptr);
-        if (t) { DWORD pid = 0; GetWindowThreadProcessId(t, &pid); AllowSetForegroundWindow(pid); PostMessageW(t, WM_APP + 3, 0, 0); }   // our foreground right goes to the running Vikey: its window comes to the front
+        if (t) { DWORD pid = 0; GetWindowThreadProcessId(t, &pid); AllowSetForegroundWindow(pid); PostMessageW(t, WM_APP + 3, 0, 0); }
         return 0;
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    if (vikey::updater::installPendingAtLaunch()) return 0;   // an update downloaded earlier installs now and relaunches Vikey
+    if (vikey::updater::installPendingAtLaunch()) return 0;
     vikey::prefs::migrateFromOpenKey();
     WNDCLASSW wc = {}; wc.lpfnWndProc = wndProc; wc.hInstance = inst; wc.lpszClassName = L"VikeyTray";
     RegisterClassW(&wc);
-    // hidden top-level, not HWND_MESSAGE: a message-only window gets no broadcasts (TaskbarCreated, WM_SETTINGCHANGE);
-    // WS_EX_TOOLWINDOW keeps it out of the taskbar and Alt+Tab
     _hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"VikeyTray", L"Vikey", 0, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
     bool dark = darkTaskbar(); _iconV = makeIcon(L'V', dark); _iconE = makeIcon(L'E', dark);
     _nid.cbSize = sizeof(_nid); _nid.hWnd = _hwnd; _nid.uID = 1; _nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; _nid.uCallbackMessage = WM_TRAY; _nid.hIcon = _iconV;
@@ -150,13 +160,32 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (!vikey::core::start()) { MessageBoxW(nullptr, L"Không cài được bộ bắt phím (SetWindowsHookEx).", L"Vikey", MB_ICONERROR); return 1; }
     updateTray(vikey::core::language());
     vikey::emoji::install(inst);
-    vikey::core::setEmojiHotkeyHandler([] { PostMessageW(_hwnd, WM_VIKEY_EMOJI, 0, 0); });   // not inside the hook: opening can take a moment
-    if (!vikey::prefs::has(L"FirstRunDone")) vikey::ui::showSettings(inst, true);
+    vikey::core::setEmojiHotkeyHandler([] { PostMessageW(_hwnd, WM_VIKEY_EMOJI, 0, 0); });
+    const wchar_t* cl = GetCommandLineW();
+    if (cl && wcsstr(cl, L"--show")) vikey::ui::showSettings(inst, false);
+    else if (!vikey::prefs::has(L"FirstRunDone")) vikey::ui::showSettings(inst, true);
     SetTimer(_hwnd, TIMER_FLUSH, 10000, nullptr);
     vikey::updater::start(_hwnd);
-    vikey::crash::checkAtLaunch();   // after a crash: ask to send the report (on its own thread)
-    vikey::site::start(_hwnd);   // per-website memory and password fields, read off the hook thread
-    MSG msg; while (GetMessageW(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    vikey::crash::checkAtLaunch();
+    vikey::site::start(_hwnd);
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            HWND fg = GetForegroundWindow();
+            DWORD pid = 0; GetWindowThreadProcessId(fg, &pid);
+            if (pid == GetCurrentProcessId() && fg != _hwnd) {
+                wchar_t cls[64] = {}; GetClassNameW(fg, cls, 64);
+                if (wcscmp(cls, L"VikeyHotkey") != 0) { PostMessageW(fg, WM_CLOSE, 0, 0); continue; }
+            }
+        }
+        HWND root = GetAncestor(msg.hwnd, GA_ROOT);
+        if (root && root != _hwnd) {
+            wchar_t focusCls[64] = {}; GetClassNameW(msg.hwnd, focusCls, 64);
+            if (wcscmp(focusCls, L"VikeyHotkey") != 0 && IsDialogMessageW(root, &msg)) continue;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
     ReleaseMutex(single); CloseHandle(single);
     return 0;
 }

@@ -135,4 +135,4 @@ void migrateFromOpenKey() {
     RegCloseKey(h);
 }
 
-}} // namespace
+}}
