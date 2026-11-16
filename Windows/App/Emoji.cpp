@@ -1,9 +1,11 @@
-// Emoji picker popup: Direct2D + DirectWrite renderer with bilingual Telex search and Reze dual-theme styling.
+// Emoji picker popup: Direct2D + DirectWrite renderer over a blurred Reze artwork glass canvas.
 #define _HAS_STD_BYTE 0
 #include <windows.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwmapi.h>
+#include <shlwapi.h>
+#include <objidl.h>
 #include <windowsx.h>
 #include <algorithm>
 #include <map>
@@ -11,6 +13,9 @@
 #include <mutex>
 #include <thread>
 #include <functional>
+#define GDIPVER 0x0110
+namespace Gdiplus { using std::min; using std::max; }
+#include <gdiplus.h>
 #include "Emoji.h"
 #include "Core.h"
 #include "Prefs.h"
@@ -19,6 +24,8 @@
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "shlwapi.lib")
 
 namespace vikey { namespace emoji {
 
@@ -39,7 +46,6 @@ static std::vector<std::wstring> splitWords(const std::wstring& s, wchar_t sep =
 }
 static std::wstring trim(const std::wstring& s) { size_t a = s.find_first_not_of(L' '), b = s.find_last_not_of(L' '); return a == std::wstring::npos ? L"" : s.substr(a, b - a + 1); }
 
-/// Lowercase, strip combining accents, and fold đ -> d.
 static std::wstring fold(const std::wstring& s) {
     std::wstring l = lower(s); if (l.empty()) return l;
     int n = NormalizeString(NormalizationD, l.c_str(), (int)l.size(), nullptr, 0);
@@ -85,7 +91,6 @@ static std::vector<Emoji> _all;
 static std::vector<std::pair<int, std::vector<int>>> _groups;
 static std::mutex _loadMutex; static bool _loaded = false;
 
-/// Checks whether Segoe UI Emoji can shape the sequence into a single glyph cluster.
 struct GlyphCheck {
     IDWriteFactory* dw = nullptr; IDWriteTextFormat* fmt = nullptr; IDWriteFontFace* face = nullptr;
     GlyphCheck() {
@@ -254,9 +259,9 @@ static std::vector<std::wstring> usageFrequent(int n) {
 }
 
 static const int COLS = 9; static const float CELL = 44, WIDTH = COLS * CELL + 24, HEIGHT = 412;
-static const float SEARCH_H = 48, FOOTER_H = 44, GRID_PAD = 8, GRID_X = 12;
-static const wchar_t* GROUP_VI[] = {L"MẶT CƯỜI & CẢM XÚC", L"NGƯỜI & CƠ THỂ", L"", L"ĐỘNG VẬT & THIÊN NHIÊN", L"ĐỒ ĂN & THỨC UỐNG", L"DU LỊCH & ĐỊA ĐIỂM", L"HOẠT ĐỘNG", L"ĐỒ VẬT", L"BIỂU TƯỢNG", L"CỜ"};
-static const wchar_t* GROUP_EN[] = {L"SMILEYS & EMOTION", L"PEOPLE & BODY", L"", L"ANIMALS & NATURE", L"FOOD & DRINK", L"TRAVEL & PLACES", L"ACTIVITIES", L"OBJECTS", L"SYMBOLS", L"FLAGS"};
+static const float SEARCH_H = 50, FOOTER_H = 44, GRID_PAD = 8, GRID_X = 12;
+static const wchar_t* GROUP_VI[] = {L"Mặt cười & cảm xúc", L"Người & cơ thể", L"", L"Động vật & thiên nhiên", L"Đồ ăn & thức uống", L"Du lịch & địa điểm", L"Hoạt động", L"Đồ vật", L"Biểu tượng", L"Cờ"};
+static const wchar_t* GROUP_EN[] = {L"Smileys & Emotion", L"People & Body", L"", L"Animals & Nature", L"Food & Drink", L"Travel & Places", L"Activities", L"Objects", L"Symbols", L"Flags"};
 
 struct Row { bool header; std::wstring title; int start, count; float y, h; };
 static std::wstring _raw; static bool _allSelected = false; static bool _vietnamese = true;
@@ -277,7 +282,7 @@ static void relayout() {
     };
     if (_searching()) add(L"", _results);
     else {
-        add(_vietnamese ? L"DÙNG THƯỜNG XUYÊN" : L"FREQUENTLY USED", _recents);
+        add(_vietnamese ? L"Dùng thường xuyên" : L"Frequently Used", _recents);
         for (auto& g : _groups) if (g.first >= 0 && g.first < 10) add(_vietnamese ? GROUP_VI[g.first] : GROUP_EN[g.first], g.second);
     }
     _contentH = y;
@@ -318,10 +323,94 @@ static HINSTANCE _inst; static HWND _win; static bool _open = false; static bool
 static ID2D1Factory* _d2d; static IDWriteFactory* _dw; static ID2D1DCRenderTarget* _rt;
 static IDWriteTextFormat *_fSearch, *_fHeader, *_fFooter, *_fEmoji, *_fEmojiFooter, *_fTone, *_fWordmark, *_fBadge, *_fEmpty;
 static ID2D1SolidColorBrush *_bPanel, *_bText, *_bSecondary, *_bTertiary, *_bBrand, *_bBrandInk, *_bBrandSoft, *_bEmerald, *_bSep, *_bBorder, *_bSelect;
+static ID2D1Bitmap* _bgBitmap = nullptr;
 static float _dpi = 96;
 static const UINT TIMER_CARET = 1;
 
 static bool isDark() { return prefs::getInt(L"RezeTheme", 0) == 0; }
+
+static Gdiplus::Bitmap* loadResArt(int resId) {
+    HRSRC r = FindResourceW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(resId), RT_RCDATA);
+    HGLOBAL g = r ? LoadResource(GetModuleHandleW(nullptr), r) : nullptr;
+    const void* data = g ? LockResource(g) : nullptr;
+    DWORD sz = r ? SizeofResource(GetModuleHandleW(nullptr), r) : 0;
+    if (!data || !sz) return nullptr;
+    IStream* s = SHCreateMemStream((const BYTE*)data, sz);
+    if (!s) return nullptr;
+    Gdiplus::Bitmap* b = Gdiplus::Bitmap::FromStream(s);
+    s->Release();
+    return (b && b->GetLastStatus() == Gdiplus::Ok) ? b : nullptr;
+}
+
+/// Builds a blurred + glass-tinted background bitmap for the Emoji Picker popup.
+static ID2D1Bitmap* buildBlurredGlassBg(ID2D1RenderTarget* rt, int w, int h, bool dark) {
+    int resIds[4] = {IDR_REZE_NIGHT, IDR_REZE_ABYSS, IDR_REZE_FLOWER, IDR_REZE_GRAPHIC};
+    int idx = prefs::getInt(L"RezeArtIndex", dark ? 1 : 2) & 3;
+    Gdiplus::Bitmap* art = loadResArt(resIds[idx]);
+    if (!art) return nullptr;
+
+    int sw = std::max(1, w / 3), sh = std::max(1, h / 3);
+    Gdiplus::Bitmap smallBmp(sw, sh, PixelFormat32bppPARGB);
+    {
+        Gdiplus::Graphics g(&smallBmp);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+        float bw = (float)art->GetWidth(), bh = (float)art->GetHeight();
+        float scale = std::max((float)sw / bw, (float)sh / bh);
+        float cropW = sw / scale, cropH = sh / scale;
+        g.DrawImage(art, Gdiplus::RectF(0, 0, (float)sw, (float)sh), (bw - cropW) * 0.5f, (bh - cropH) * 0.3f, cropW, cropH, Gdiplus::UnitPixel);
+    }
+    delete art;
+
+    Gdiplus::BitmapData bd;
+    Gdiplus::Rect rect(0, 0, sw, sh);
+    if (smallBmp.LockBits(&rect, Gdiplus::ImageLockModeRead | Gdiplus::ImageLockModeWrite, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+        std::vector<DWORD> tmp(sw * sh);
+        DWORD* px = (DWORD*)bd.Scan0;
+        int rad = 5;
+        for (int pass = 0; pass < 3; pass++) {
+            for (int y = 0; y < sh; y++) {
+                for (int x = 0; x < sw; x++) {
+                    int r = 0, g = 0, b = 0, cnt = 0;
+                    for (int k = -rad; k <= rad; k++) {
+                        int nx = std::min(sw - 1, std::max(0, x + k));
+                        DWORD c = px[y * sw + nx];
+                        r += (c >> 16) & 255; g += (c >> 8) & 255; b += c & 255; cnt++;
+                    }
+                    tmp[y * sw + x] = 0xFF000000 | ((r / cnt) << 16) | ((g / cnt) << 8) | (b / cnt);
+                }
+            }
+            for (int y = 0; y < sh; y++) {
+                for (int x = 0; x < sw; x++) {
+                    int r = 0, g = 0, b = 0, cnt = 0;
+                    for (int k = -rad; k <= rad; k++) {
+                        int ny = std::min(sh - 1, std::max(0, y + k));
+                        DWORD c = tmp[ny * sw + x];
+                        r += (c >> 16) & 255; g += (c >> 8) & 255; b += c & 255; cnt++;
+                    }
+                    px[y * sw + x] = 0xFF000000 | ((r / cnt) << 16) | ((g / cnt) << 8) | (b / cnt);
+                }
+            }
+        }
+        // Blend with frosted glass tint (78% obsidian in Dark, 84% porcelain in Light)
+        int tr = dark ? 12 : 244, tg = dark ? 18 : 249, tb = dark ? 30 : 255, alpha = dark ? 196 : 214;
+        for (int i = 0; i < sw * sh; i++) {
+            DWORD c = px[i];
+            int r = (((c >> 16) & 255) * (255 - alpha) + tr * alpha) / 255;
+            int g = (((c >> 8) & 255) * (255 - alpha) + tg * alpha) / 255;
+            int b = ((c & 255) * (255 - alpha) + tb * alpha) / 255;
+            px[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
+        }
+        smallBmp.UnlockBits(&bd);
+    }
+
+    ID2D1Bitmap* out = nullptr;
+    if (smallBmp.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &bd) == Gdiplus::Ok) {
+        rt->CreateBitmap(D2D1::SizeU(sw, sh), bd.Scan0, bd.Stride,
+                         D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)), &out);
+        smallBmp.UnlockBits(&bd);
+    }
+    return out;
+}
 
 static IDWriteTextFormat* fmt(const wchar_t* face, float size, DWRITE_FONT_WEIGHT w = DWRITE_FONT_WEIGHT_NORMAL, bool center = false, bool wrap = false) {
     IDWriteTextFormat* f = nullptr; _dw->CreateTextFormat(face, nullptr, w, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"", &f);
@@ -334,6 +423,7 @@ static IDWriteTextFormat* fmt(const wchar_t* face, float size, DWRITE_FONT_WEIGH
 }
 static void dropGraphics() {
     for (auto** b : {&_bPanel, &_bText, &_bSecondary, &_bTertiary, &_bBrand, &_bBrandInk, &_bBrandSoft, &_bEmerald, &_bSep, &_bBorder, &_bSelect}) if (*b) { (*b)->Release(); *b = nullptr; }
+    if (_bgBitmap) { _bgBitmap->Release(); _bgBitmap = nullptr; }
     if (_rt) { _rt->Release(); _rt = nullptr; }
 }
 static void ensureGraphics() {
@@ -341,14 +431,14 @@ static void ensureGraphics() {
     if (!_dw) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&_dw);
     if (!_fSearch && _dw) {
         _fSearch = fmt(L"Segoe UI", 16, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-        _fHeader = fmt(L"Segoe UI", 11, DWRITE_FONT_WEIGHT_BOLD);
+        _fHeader = fmt(L"Segoe UI", 12, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         _fFooter = fmt(L"Segoe UI", 13, DWRITE_FONT_WEIGHT_SEMI_BOLD);
         if (_fFooter) { IDWriteInlineObject* sign = nullptr; _dw->CreateEllipsisTrimmingSign(_fFooter, &sign); DWRITE_TRIMMING tr = {DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0}; _fFooter->SetTrimming(&tr, sign); if (sign) sign->Release(); }
         _fEmoji = fmt(L"Segoe UI Emoji", 28, DWRITE_FONT_WEIGHT_NORMAL, true);
         _fEmojiFooter = fmt(L"Segoe UI Emoji", 22);
         _fTone = fmt(L"Segoe UI Emoji", 18, DWRITE_FONT_WEIGHT_NORMAL, true);
-        _fWordmark = fmt(L"Segoe UI", 13, DWRITE_FONT_WEIGHT_HEAVY);
-        _fBadge = fmt(L"Consolas", 12, DWRITE_FONT_WEIGHT_BOLD, true);
+        _fWordmark = fmt(L"Segoe UI", 13, DWRITE_FONT_WEIGHT_BOLD);
+        _fBadge = fmt(L"Segoe UI", 11, DWRITE_FONT_WEIGHT_BOLD, true);
         _fEmpty = fmt(L"Segoe UI", 14, DWRITE_FONT_WEIGHT_NORMAL, true, true);
     }
     if (!_rt && _d2d) {
@@ -359,17 +449,18 @@ static void ensureGraphics() {
         _d2d->CreateDCRenderTarget(&props, &_rt);
         if (_rt) {
             bool dark = isDark();
-            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x121926 : 0xFFFFFF), &_bPanel);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0xF2F5FA : 0x0D1321), &_bText);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0xA6B4C9 : 0x3E4C63), &_bSecondary);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x0E1525 : 0xFFFFFF, dark ? 0.55f : 0.65f), &_bPanel);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0xF4F7FB : 0x0F172A), &_bText);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0xB0C0D8 : 0x334155), &_bSecondary);
             _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x8FA2BD : 0x526077), &_bTertiary);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x38BDF8 : 0x1D4ED8), &_bBrand);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x0B0F17 : 0xFFFFFF), &_bBrandInk);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x38BDF8 : 0x1D4ED8, 0.25f), &_bBrandSoft);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x34D399 : 0x047857), &_bEmerald);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x263348 : 0xCBD5E1), &_bSep);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x647894 : 0x6E7F99), &_bBorder);
-            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x192B42 : 0xDBEAFE), &_bSelect);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x58C4F6 : 0x2563EB), &_bBrand);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x0B101B : 0xFFFFFF), &_bBrandInk);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x58C4F6 : 0x2563EB, 0.25f), &_bBrandSoft);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x34D399 : 0x059669), &_bEmerald);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0xFFFFFF : 0x0F172A, 0.14f), &_bSep);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x93C5FD : 0x64748B, 0.35f), &_bBorder);
+            _rt->CreateSolidColorBrush(D2D1::ColorF(dark ? 0x58C4F6 : 0x2563EB, 0.24f), &_bSelect);
+            _bgBitmap = buildBlurredGlassBg(_rt, (int)WIDTH, (int)HEIGHT, dark);
         }
     }
 }
@@ -384,9 +475,9 @@ static D2D1_RECT_F toneRect() { return D2D1::RectF(WIDTH - 12 - 30, HEIGHT - FOO
 
 static void applyWindowFrame() {
     if (!_win) return;
-    DWORD corner = 1; // DWMWCP_DONOTROUND: zero rounded corners
+    DWORD corner = 2; // DWMWCP_ROUND: smooth native rounded window corners
     DwmSetWindowAttribute(_win, 33, &corner, sizeof(corner));
-    COLORREF border = isDark() ? RGB(100, 120, 148) : RGB(110, 127, 153);
+    COLORREF border = isDark() ? RGB(70, 105, 145) : RGB(165, 190, 220);
     DwmSetWindowAttribute(_win, 34, &border, sizeof(border));
 }
 
@@ -398,32 +489,32 @@ static void paint(HDC targetDc) {
     HGDIOBJ old = SelectObject(mem, bmp);
     _rt->BindDC(mem, &rc);
     _rt->BeginDraw();
-    _rt->Clear(D2D1::ColorF(isDark() ? 0x0B0F17 : 0xEDF2F9));
-    // Sharp top search bar panel with Reze choker-pin accent strip
-    _rt->FillRectangle(D2D1::RectF(0, 0, WIDTH, SEARCH_H), _bPanel);
-    _rt->FillRectangle(D2D1::RectF(0, 0, 4, SEARCH_H), _bBrand);
-    float sx = 16, sy = 12, sh = 24;
-    // Magnifier with choker pin ring geometry
-    _rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(sx + 7, sy + 10), 5.5f, 5.5f), _bBrand, 1.8f);
-    _rt->DrawLine(D2D1::Point2F(sx + 11, sy + 14), D2D1::Point2F(sx + 16, sy + 19), _bBrand, 2.0f);
-    float tx = sx + 26; std::wstring disp = _display(); float tw = textWidth(disp, _fSearch);
-    float badgeW = 34; D2D1_RECT_F badge = D2D1::RectF(WIDTH - 12 - badgeW, sy + 2, WIDTH - 12, sy + sh - 2);
-    if (_allSelected && !disp.empty()) _rt->FillRectangle(D2D1::RectF(tx - 1, sy + 1, tx + tw + 1, sy + sh - 1), _bBrandSoft);
+    _rt->Clear(D2D1::ColorF(isDark() ? 0x0D131F : 0xF0F6FF));
+    if (_bgBitmap) _rt->DrawBitmap(_bgBitmap, D2D1::RectF(0, 0, WIDTH, HEIGHT), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+
+    // Frosted search bar pill
+    D2D1_RECT_F searchBox = D2D1::RectF(10, 8, WIDTH - 10, SEARCH_H - 6);
+    _rt->FillRoundedRectangle(D2D1::RoundedRect(searchBox, 11, 11), _bPanel);
+    _rt->DrawRoundedRectangle(D2D1::RoundedRect(searchBox, 11, 11), _bBorder, 1.0f);
+    float sx = 22, sy = 13, sh = 24;
+    _rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(sx + 6, sy + 10), 5.5f, 5.5f), _bBrand, 1.8f);
+    _rt->DrawLine(D2D1::Point2F(sx + 10, sy + 14), D2D1::Point2F(sx + 15, sy + 19), _bBrand, 1.8f);
+    float tx = sx + 24; std::wstring disp = _display(); float tw = textWidth(disp, _fSearch);
+    float badgeW = 32; D2D1_RECT_F badge = D2D1::RectF(WIDTH - 18 - badgeW, sy + 2, WIDTH - 18, sy + sh - 2);
+    if (_allSelected && !disp.empty()) _rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tx - 2, sy + 1, tx + tw + 2, sy + sh - 1), 5, 5), _bBrandSoft);
     text(disp, _fSearch, D2D1::RectF(tx, sy, badge.left - 8, sy + sh), _bText);
-    if (_caret && !_allSelected) _rt->FillRectangle(D2D1::RectF(tx + tw + 1, sy + 3, tx + tw + 3, sy + sh - 3), _bEmerald);
+    if (_caret && !_allSelected) _rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tx + tw + 1, sy + 3, tx + tw + 3, sy + sh - 3), 1, 1), _bBrand);
     if (_raw.empty()) text(_vietnamese ? L"Tìm emoji: ngựa, horse, cười…" : L"Search emoji: horse, ngựa, smile…", _fSearch, D2D1::RectF(tx + 4, sy, badge.left - 8, sy + sh), _bTertiary);
-    // Sharp rectangular language badge
-    _rt->FillRectangle(badge, _bBrand);
+    _rt->FillRoundedRectangle(D2D1::RoundedRect(badge, 6, 6), _bBrand);
     text(_vietnamese ? L"VI" : L"EN", _fBadge, badge, _bBrandInk);
-    _rt->FillRectangle(D2D1::RectF(0, SEARCH_H, WIDTH, SEARCH_H + 1), _bBorder);
 
     // Emoji grid viewport
     float gt = SEARCH_H + 1, gb = HEIGHT - FOOTER_H - 1;
-    _rt->PushAxisAlignedClip(D2D1::RectF(0, gt + GRID_PAD, WIDTH, gb - GRID_PAD), D2D1_ANTIALIAS_MODE_ALIASED);
+    _rt->PushAxisAlignedClip(D2D1::RectF(0, gt + GRID_PAD, WIDTH, gb - GRID_PAD), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     if (_searching() && _results.empty()) {
         D2D1_RECT_F er = D2D1::RectF(24, gt + 84, WIDTH - 24, gt + 170);
-        _rt->FillRectangle(er, _bPanel);
-        _rt->DrawRectangle(er, _bBorder, 1.0f);
+        _rt->FillRoundedRectangle(D2D1::RoundedRect(er, 12, 12), _bPanel);
+        _rt->DrawRoundedRectangle(D2D1::RoundedRect(er, 12, 12), _bBorder, 1.0f);
         text(_vietnamese ? L"Không khớp từ khoá nào.\nThử từ khác (cười, tim, mèo) hoặc bấm Esc để xoá bộ lọc."
                          : L"No matching emoji.\nTry another keyword (smile, heart, cat) or press Esc to clear.", _fEmpty, er, _bSecondary);
     }
@@ -431,45 +522,38 @@ static void paint(HDC targetDc) {
         float y = gridTop() + r.y - _scrollY; if (y + r.h < gt || y > gb) continue;
         if (r.header) {
             float pad = r.h - 20;
-            _rt->FillRectangle(D2D1::RectF(GRID_X, y + pad + 3, GRID_X + 6, y + pad + 11), _bBrand);
-            text(r.title, _fHeader, D2D1::RectF(GRID_X + 12, y + pad, WIDTH - GRID_X, y + pad + 14), _bSecondary);
+            text(r.title, _fHeader, D2D1::RectF(GRID_X + 4, y + pad, WIDTH - GRID_X, y + pad + 16), _bSecondary);
             continue;
         }
         for (int c = 0; c < r.count; c++) {
             int idx = r.start + c; D2D1_RECT_F cr = cellRect(r, c);
             if (idx == _selected) {
-                D2D1_RECT_F sr = D2D1::RectF(cr.left + 1, cr.top + 1, cr.right - 1, cr.bottom - 1);
-                _rt->FillRectangle(sr, _bSelect);
-                _rt->DrawRectangle(sr, _bBrand, 1.5f);
-                // Brutalist corner tick marks
-                _rt->FillRectangle(D2D1::RectF(sr.left, sr.top, sr.left + 6, sr.top + 2), _bEmerald);
-                _rt->FillRectangle(D2D1::RectF(sr.left, sr.top, sr.left + 2, sr.top + 6), _bEmerald);
-                _rt->FillRectangle(D2D1::RectF(sr.right - 6, sr.bottom - 2, sr.right, sr.bottom), _bEmerald);
-                _rt->FillRectangle(D2D1::RectF(sr.right - 2, sr.bottom - 6, sr.right, sr.bottom), _bEmerald);
+                D2D1_RECT_F sr = D2D1::RectF(cr.left + 2, cr.top + 2, cr.right - 2, cr.bottom - 2);
+                _rt->FillRoundedRectangle(D2D1::RoundedRect(sr, 10, 10), _bSelect);
+                _rt->DrawRoundedRectangle(D2D1::RoundedRect(sr, 10, 10), _bBrand, 1.4f);
             }
             text(_all[_visible[idx]].withSkin(_tone), _fEmoji, cr, _bText);
         }
     }
     _rt->PopAxisAlignedClip();
-    _rt->FillRectangle(D2D1::RectF(0, gb, WIDTH, gb + 1), _bBorder);
+    _rt->FillRectangle(D2D1::RectF(12, gb, WIDTH - 12, gb + 1), _bSep);
 
-    // Sharp footer bar
+    // Frosted footer bar
     float fy = HEIGHT - FOOTER_H;
     _rt->FillRectangle(D2D1::RectF(0, fy, WIDTH, HEIGHT), _bPanel);
     if (const Emoji* e = _current()) {
-        text(e->withSkin(_tone), _fEmojiFooter, D2D1::RectF(12, fy, 12 + 32, HEIGHT), _bText);
-        text(_vietnamese ? e->nameVI : e->nameEN, _fFooter, D2D1::RectF(12 + 32 + 6, fy, WIDTH - 144, HEIGHT), _bSecondary);
+        text(e->withSkin(_tone), _fEmojiFooter, D2D1::RectF(14, fy, 14 + 32, HEIGHT), _bText);
+        text(_vietnamese ? e->nameVI : e->nameEN, _fFooter, D2D1::RectF(14 + 32 + 6, fy, WIDTH - 144, HEIGHT), _bSecondary);
     }
     D2D1_RECT_F tr = toneRect();
-    _rt->DrawRectangle(tr, _bBorder, 1.0f);
+    _rt->FillRoundedRectangle(D2D1::RoundedRect(tr, 7, 7), _bPanel);
+    _rt->DrawRoundedRectangle(D2D1::RoundedRect(tr, 7, 7), _bBorder, 1.0f);
     static const wchar_t* HANDS[] = {L"✋", L"✋🏻", L"✋🏼", L"✋🏽", L"✋🏾", L"✋🏿"};
     text(HANDS[_tone], _fTone, tr, _bText);
-    _rt->FillRectangle(D2D1::RectF(tr.left - 10, fy + 10, tr.left - 9, HEIGHT - 10), _bSep);
+    _rt->FillRectangle(D2D1::RectF(tr.left - 10, fy + 12, tr.left - 9, HEIGHT - 12), _bSep);
     float wx = tr.left - 18; float keyW = textWidth(L"key", _fWordmark), viW = textWidth(L"Vi", _fWordmark);
     text(L"key", _fWordmark, D2D1::RectF(wx - keyW, fy, wx, HEIGHT), _bBrand); wx -= keyW;
     text(L"Vi", _fWordmark, D2D1::RectF(wx - viW, fy, wx, HEIGHT), _bText);
-    // Outer 1px frame
-    _rt->DrawRectangle(D2D1::RectF(0.5f, 0.5f, WIDTH - 0.5f, HEIGHT - 0.5f), _bBorder, 1.0f);
     if (_rt->EndDraw() == D2DERR_RECREATE_TARGET) dropGraphics();
     BitBlt(targetDc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);

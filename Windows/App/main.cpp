@@ -28,7 +28,7 @@ enum { ID_VIET = 100, ID_ENG, ID_SETTINGS, ID_AUTOSWITCH, ID_THEME, ID_UPDATE, I
 static HWND _hwnd; static NOTIFYICONDATAW _nid = {};
 static HICON _iconV, _iconE;
 
-/// Draws the tray badge: a sharp brutalist square with a corner notch and a cut-out V or E.
+/// Draws the tray badge: a smooth rounded square with a cut-out V or E.
 static HICON makeIcon(wchar_t letter, bool dark) {
     const int S = 32;
     HDC dc = CreateCompatibleDC(nullptr);
@@ -36,25 +36,14 @@ static HICON makeIcon(wchar_t letter, bool dark) {
     void* bits = nullptr; HBITMAP color = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HGDIOBJ old = SelectObject(dc, color);
     DWORD* px = (DWORD*)bits; for (int i = 0; i < S * S; i++) px[i] = 0;
-    COLORREF fg = dark ? RGB(242, 245, 250) : RGB(13, 19, 33);
+    COLORREF fg = dark ? RGB(244, 247, 251) : RGB(15, 23, 42);
     HBRUSH b = CreateSolidBrush(fg); HPEN p = CreatePen(PS_NULL, 0, 0);
     SelectObject(dc, b); SelectObject(dc, p);
-    Rectangle(dc, 2, 2, S - 2, S - 2);
-    HFONT f = CreateFontW(-22, 0, 0, 0, FW_HEAVY, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    RoundRect(dc, 2, 3, S - 2, S - 3, 10, 10);
+    HFONT f = CreateFontW(-22, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     SelectObject(dc, f); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(1, 2, 3));
-    RECT r = {0, 0, S, S}; DrawTextW(dc, &letter, 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    // Punch the letter out and add a 4x4 Reze cyan/emerald corner marker at top-right.
-    DWORD accent = (letter == L'V') ? 0xFF38BDF8 : 0xFF34D399;
-    for (int y = 0; y < S; y++) {
-        for (int x = 0; x < S; x++) {
-            int i = y * S + x;
-            DWORD c = px[i] & 0xFFFFFF;
-            if (x >= S - 7 && x < S - 2 && y >= 2 && y < 7) px[i] = accent;
-            else if (c == 0x030201) px[i] = 0;
-            else if (c != 0) px[i] |= 0xFF000000;
-            else px[i] = 0;
-        }
-    }
+    RECT r = {0, 1, S, S}; DrawTextW(dc, &letter, 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    for (int i = 0; i < S * S; i++) { DWORD c = px[i] & 0xFFFFFF; if (c == 0x030201) px[i] = 0; else if (c != 0) px[i] |= 0xFF000000; else px[i] = 0; }
     SelectObject(dc, old); DeleteObject(f); DeleteObject(b); DeleteObject(p); DeleteDC(dc);
     HBITMAP mask = CreateBitmap(S, S, 1, 1, nullptr);
     ICONINFO ii = {TRUE, 0, 0, mask, color}; HICON h = CreateIconIndirect(&ii);
